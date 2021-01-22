@@ -124,3 +124,157 @@ impl<T> Drop for Queue<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crossbeam_epoch::pin;
+    use crossbeam_utils::thread;
+
+    struct Queue<T> {
+        queue: super::Queue<T>,
+    }
+
+    impl<T> Queue<T> {
+        pub fn new() -> Queue<T> {
+            Queue {
+                queue: super::Queue::new(),
+            }
+        }
+
+        pub fn push(&self, t: T) {
+            let gurad = &pin();
+            self.queue.push(t, gurad);
+        }
+
+        pub fn is_empty(&self) -> bool {
+            let gurad = &pin();
+            let head_snapshot = self.queue.head.load(Ordering::Acquire, gurad);
+            let head = unsafe { head_snapshot.deref() };
+            head.next.load(Ordering::Acquire, gurad).is_null()
+        }
+
+        pub fn try_pop(&self) -> Option<T> {
+            let gurad = &pin();
+            self.queue.try_pop(gurad)
+        }
+
+        pub fn pop(&self) -> T {
+            loop {
+                match self.try_pop() {
+                    None => continue,
+                    Some(t) => return t,
+                }
+            }
+        }
+    }
+
+    const CONC_COUNT: i64 = 1000000;
+
+    #[test]
+    fn push_try_pop() {
+        let queue: Queue<i64> = Queue::new();
+        assert!(queue.is_empty());
+        queue.push(39);
+        assert!(!queue.is_empty());
+        assert_eq!(queue.try_pop(), Some(39));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn push_try_pop_many_spsc() {
+        let queue: Queue<i64> = Queue::new();
+        assert!(queue.is_empty());
+
+        thread::scope(|scope| {
+            scope.spawn(|_| {
+                let mut next = 0;
+
+                while next < CONC_COUNT {
+                    if let Some(elem) = queue.try_pop() {
+                        assert_eq!(next, elem);
+                        next += 1;
+                    }
+                }
+            });
+
+            for i in 0..CONC_COUNT {
+                queue.push(i)
+            }
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn push_try_pop_spmc() {
+        fn recv(_: i32, queue: &Queue<i64>) {
+            let mut cur = -1;
+            for _ in 0..CONC_COUNT {
+                if let Some(elem) = queue.try_pop() {
+                    assert!(elem > cur);
+                    cur = elem;
+
+                    if cur == CONC_COUNT - 1 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let queue: Queue<i64> = Queue::new();
+        assert!(queue.is_empty());
+
+        thread::scope(|scope| {
+            for i in 0..3 {
+                let queue = &queue;
+                scope.spawn(move |_| recv(i, queue));
+            }
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn push_try_pop_mpmc() {
+        enum LR {
+            Left(i64),
+            Right(i64),
+        }
+
+        let queue: Queue<LR> = Queue::new();
+        assert!(queue.is_empty());
+
+        thread::scope(|scope| {
+            scope.spawn(|_| {
+                for i in 0..CONC_COUNT {
+                    queue.push(LR::Left(i))
+                }
+            });
+            scope.spawn(|_| {
+                for i in 0..CONC_COUNT {
+                    queue.push(LR::Right(i))
+                }
+            });
+            scope.spawn(|_| {
+                let mut vl = vec![];
+                let mut vr = vec![];
+                for _ in 0..2 * CONC_COUNT {
+                    match queue.try_pop() {
+                        Some(LR::Left(left_value)) => vl.push(left_value),
+                        Some(LR::Right(right_value)) => vr.push(right_value),
+                        _ => {}
+                    }
+                }
+
+                let mut vl2 = vl.clone();
+                let mut vr2 = vr.clone();
+
+                vl2.sort();
+                vr2.sort();
+
+                assert_eq!(vl, vl2);
+                assert_eq!(vr, vr2);
+            });
+        })
+        .unwrap();
+    }
+}
